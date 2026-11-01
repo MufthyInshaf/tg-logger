@@ -1,7 +1,7 @@
-"""Telegram Quotex signal logger -> data/signals.csv + data/raw_messages.csv
+"""Telegram Quotex signal logger v2 -> data/signals.csv + data/raw_messages.csv
 GitHub Actions-ல் ஓடும். Secrets: API_ID, API_HASH, SESSION_STRING
 """
-import os, re, csv, json, asyncio
+import os, re, csv, json, asyncio, unicodedata
 from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -53,7 +53,7 @@ CHANNEL = CHANNEL_LIST[0][0] if CHANNEL_LIST else ""   # trader_demo பழை�
 FIELDS = ["channel", "msg_id", "msg_utc", "fmt", "pair", "entry_local", "entry_utc",
           "lead_sec", "expiry", "direction", "price", "channel_rate_pct",
           "result_raw", "result_class", "result_utc"]
-RAW_FIELDS = ["channel", "msg_id", "msg_utc", "text"]
+RAW_FIELDS = ["channel", "msg_id", "msg_utc", "reply_to", "text"]
 
 # result_class: DW = முதல் ட்ரேடிலேயே வெற்றி, MW = முதல் தோல்வி, MTG-ல் வெற்றி,
 #               L = MTG-க்குப் பிறகும் தோல்வி, D = doji/draw
@@ -79,20 +79,30 @@ def outcome_class(o):
 
 
 def norm_pair(p):
-    return p.upper().replace("-OTCQ", "-OTC")
+    """EURUSD-OTCq / EUR/USD OTC / EURUSD_otc -> EURUSD-OTC (ஒப்பிடுவதற்கான பொது வடிவம்)"""
+    p = re.sub(r"[\s/]", "", (p or "").upper())
+    return re.sub(r"[-_]?OTC[QP]?$", "-OTC", p)
 
 
 # ---------- பொது (generic) parser: A/B தவிர மற்ற சேனல்களுக்கு (fmt = "G") ----------
 CUR = ("USD|EUR|GBP|JPY|AUD|CAD|CHF|NZD|BRL|INR|PKR|BDT|ARS|COP|EGP|IDR|MXN|NGN|PHP|TRY|ZAR|DZD|KES|LBP|"
        "SGD|HKD|CNH|SEK|NOK|DKK|RUB|THB|VND|BTC|ETH|XAU|XAG|SOL|LTC|BNB|XRP|ADA|DOGE|TND|MAD|SAR|AED|QAR|UAH")
-PAIR_RE = re.compile(rf"\b(?:{CUR})\s?/?\s?(?:{CUR})(?:[-_ ]?otc[q]?)?\b", re.I)
+PAIR_RE = re.compile(rf"\b(?:{CUR})\s?/?\s?(?:{CUR})(?:[-_ ]?otc[qp]?)?\b", re.I)
 DIR_RE = re.compile(r"\b(PUT|CALL|BUY|SELL|UP|DOWN)\b", re.I)
 TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)")
-RES_RE = re.compile(r"\b(WIN|WON|LOSS|LOST|LOSE|DOJI|REFUND)\b", re.I)
-MTG_RE = re.compile(r"\b(MTG|MARTINGALE|GALE|G1|G2|LEVEL\s?\d|STEP\s?\d|PROTECTION)\b", re.I)
+RES_RE = re.compile(r"\b(WIN|WON|PROFIT|LOSS|LOST|LOSE|DOJI|REFUND)\b", re.I)
+MTG_RE = re.compile(r"\b(MTG|MG\s?\d|MARTINGALE|GALE|G1|G2|LEVEL\s?\d|STEP\s?\d|PROTECTION)\b", re.I)
 
 
 _RATE_RE = re.compile(r"\b(?:win|loss|lose|success)\s*rate\b[^\n]*", re.I)
+# "Win: 48 | Loss: 14 (77%)", "WINS : 3", "LOSSES : 0" போன்ற புள்ளிவிவர வரிகள் (முடிவு அல்ல)
+_STATS_RE = re.compile(r"\b(?:wins?|loss(?:es)?)\s*[:=]\s*\d+[^\n]*", re.I)
+
+
+def _clean(text):
+    """சிறப்பு Unicode எழுத்துகள் (𝟸𝟷:𝟺𝟶, 𝙿𝚄𝚃) -> சாதாரண ASCII; புள்ளிவிவர வரிகள் நீக்கம்"""
+    text = unicodedata.normalize("NFKC", text or "")
+    return _STATS_RE.sub("", _RATE_RE.sub("", text))
 
 
 def _clean_pair(p):
@@ -101,7 +111,7 @@ def _clean_pair(p):
 
 
 def _generic_signal(text):
-    text = _RATE_RE.sub("", text)
+    text = _clean(text)
     if RES_RE.search(text):
         return None
     p, d, t = PAIR_RE.search(text), DIR_RE.search(text), TIME_RE.search(text)
@@ -113,15 +123,19 @@ def _generic_signal(text):
 
 
 def _generic_result(text):
-    text = _RATE_RE.sub("", text)
+    """-> (pair, "HH:MM" அல்லது None, raw, class) அல்லது None.
+    நேரம் இல்லாத குறுகிய முடிவு ("AUDCAD-OTCp Profit ✅") அனுமதிக்கப்படும்; நேரம்-இல்லாததை பின்னர் pair + அருகிலுள்ள நேரத்தால் பொருத்துவோம்."""
+    text = _clean(text)
     ms = RES_RE.findall(text)
     if not ms:
         return None
     words = {w.upper() for w in ms}
-    win = bool(words & {"WIN", "WON"})
+    win = bool(words & {"WIN", "WON", "PROFIT"})
     loss = bool(words & {"LOSS", "LOST", "LOSE"})
     p, t = PAIR_RE.search(text), TIME_RE.search(text)
-    if not (p and t) or (win and loss):
+    if not p or (win and loss):
+        return None
+    if not t and len(text.strip()) > 60:      # நேரம் இல்லாத நீண்ட மெசேஜ் = முடிவு அல்ல (அரட்டை/விளம்பரம்)
         return None
     if words & {"DOJI", "REFUND"} and not (win or loss):
         cls = "D"
@@ -129,8 +143,28 @@ def _generic_result(text):
         cls = "MW" if MTG_RE.search(text) else "DW"
     else:
         cls = "L"
-    return _clean_pair(p.group(0)), "%s:%s" % (t.group(1), t.group(2)), sorted(words)[0], cls
+    hhmm = "%s:%s" % (t.group(1), t.group(2)) if t else None
+    return _clean_pair(p.group(0)), hhmm, sorted(words)[0], cls
 
+
+def _bare_result(text):
+    """pair/நேரம் இல்லாத "WIN ✅", "WIN ✅1", "LOSS ❌" -> (raw, class) அல்லது None (reply இணைப்புடன் மட்டும் பயன்படும்)"""
+    text = _clean(text).strip()
+    if not text or len(text) > 30 or PAIR_RE.search(text) or TIME_RE.search(text):
+        return None
+    ms = RES_RE.findall(text)
+    if not ms:
+        return None
+    words = {w.upper() for w in ms}
+    win = bool(words & {"WIN", "WON", "PROFIT"})
+    loss = bool(words & {"LOSS", "LOST", "LOSE"})
+    if win and loss:
+        return None
+    if win:
+        return sorted(words)[0], ("MW" if (MTG_RE.search(text) or re.search(r"WIN\W*[1-9]", text, re.I)) else "DW")
+    if loss:
+        return sorted(words)[0], "L"
+    return sorted(words)[0], "D"
 
 
 def _entry(local_msg, hhmm, future):
@@ -149,6 +183,7 @@ def _entry(local_msg, hhmm, future):
 
 def parse(text, msg_dt, msg_id, tz_offset=None):
     """சிக்னல் (வடிவம் A அல்லது B) என்றால் dict, இல்லையென்றால் None"""
+    text = unicodedata.normalize("NFKC", text or "")
     fmt = pair = tm = direction = expiry = price = rate = None
     a = find(r"PAIR\W+([A-Za-z0-9/_\-]+)", text)
     b = find(r"TIME\W+(\d{1,2}:\d{2})", text)
@@ -189,8 +224,12 @@ def parse(text, msg_dt, msg_id, tz_offset=None):
     }
 
 
-def parse_result(text, msg_dt, tz_offset=None):
-    """சேனல் வெளியிடும் முடிவு மெசேஜ் -> dict அல்லது None"""
+def parse_result(text, msg_dt, tz_offset=None, reply_to=None):
+    """சேனல் வெளியிடும் முடிவு மெசேஜ் -> dict அல்லது None.
+    entry_utc இருந்தால் (pair+நேரம்) நேரடிப் பொருத்தம்; None என்றால் pair அருகாமை அல்லது reply_to மூலம் பொருத்தம்."""
+    text = unicodedata.normalize("NFKC", text or "")
+    tz = timezone(timedelta(hours=TZ_OFFSET if tz_offset is None else tz_offset))
+    res_utc = msg_dt.astimezone(timezone.utc)
     o = find(OUTCOME_RE, text)
     if o:
         m = re.search(r"\U0001F432\s*([A-Za-z0-9/_\-]+)\s*\u2503\s*\U0001F553\s*(\d{1,2}:\d{2})", text)  # வடிவம் A
@@ -202,16 +241,22 @@ def parse_result(text, msg_dt, tz_offset=None):
         raw, cls = o.upper(), outcome_class(o)
     else:
         g = _generic_result(text)
-        if not g:
-            return None
-        pair, tm, raw, cls = g
-    if not (pair and tm):
+        if g:
+            pair, tm, raw, cls = g
+        else:
+            b = _bare_result(text) if reply_to else None
+            if not b:
+                return None
+            return {"pair": None, "entry_utc": None, "result_raw": b[0], "result_class": b[1],
+                    "result_utc": res_utc, "reply_to": int(reply_to)}
+    if not pair:
         return None
-    tz = timezone(timedelta(hours=TZ_OFFSET if tz_offset is None else tz_offset))
+    if not tm:
+        return {"pair": norm_pair(pair), "entry_utc": None, "result_raw": raw, "result_class": cls,
+                "result_utc": res_utc, "reply_to": None}
     entry = _entry(msg_dt.astimezone(tz), tm, future=False)
     return {"pair": norm_pair(pair), "entry_utc": entry.astimezone(timezone.utc),
-            "result_raw": raw, "result_class": cls,
-            "result_utc": msg_dt.astimezone(timezone.utc)}
+            "result_raw": raw, "result_class": cls, "result_utc": res_utc, "reply_to": None}
 
 
 def append_csv(path, fields, rows):
@@ -256,36 +301,75 @@ async def resolve(client, key):
     raise LookupError(f"சேனல் '{key}' கிடைக்கவில்லை. அதில் Join ஆகியுள்ளீர்களா? list_channels.py அல்லது discover ஓட்டி id-ஐச் சரிபாருங்கள்.")
 
 
+LOOSE_MAX_MIN = 20      # நேரம்-இல்லாத முடிவு: சிக்னலுக்குப் பின் அதிகபட்சம் இத்தனை நிமிடத்துக்குள்
+
+
+def _set_result(row, res):
+    row["result_raw"], row["result_class"], row["result_utc"] = \
+        res["result_raw"], res["result_class"], res["result_utc"]
+
+
 def rebuild():
     """raw_messages.csv-ல் இருந்து signals.csv-ஐ (முடிவுகளுடன்) முழுவதும் மீண்டும் உருவாக்கு.
-    Parser மேம்பட்டால் பழைய தரவுக்கும் தானாகப் பொருந்தும்."""
+    Parser மேம்பட்டால் பழைய தரவுக்கும் தானாகப் பொருந்தும்.
+    பொருத்தும் வரிசை: (1) pair+நேரம் (2) reply இணைப்பு (3) நேரம்-இல்லாத முடிவு -> அருகிலுள்ள அதே pair சிக்னல்"""
     if not os.path.exists(RAW):
         return 0, 0
     offs = {k: o for k, o in CHANNEL_LIST}
-    sigs, results = [], {}
+    sigs, by_id, exact, by_reply, loose, seen = [], {}, {}, [], [], set()
     with open(RAW, newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
             ch, text = r["channel"], r["text"] or ""
+            mid = int(r["msg_id"])
+            if (ch, mid) in seen:                       # நகல் வரிகள் தவிர்
+                continue
+            seen.add((ch, mid))
             dt = datetime.fromisoformat(r["msg_utc"])
             off = offs.get(ch, TZ_OFFSET)
-            row = parse(text, dt, int(r["msg_id"]), off)
+            rep = (r.get("reply_to") or "").strip()
+            row = parse(text, dt, mid, off)
             if row:
                 row["channel"] = ch
                 sigs.append(row)
+                by_id[(ch, mid)] = row
                 continue
-            res = parse_result(text, dt, off)
-            if res:
-                key = (ch, res["pair"], res["entry_utc"])
-                results.setdefault(key, res)          # முதல் முடிவு மட்டும்
+            res = parse_result(text, dt, off, int(rep) if rep.isdigit() else None)
+            if not res:
+                continue
+            res["channel"] = ch
+            if res["entry_utc"] is not None:
+                exact.setdefault((ch, res["pair"], res["entry_utc"]), res)   # முதல் முடிவு மட்டும்
+            elif res["reply_to"]:
+                by_reply.append(res)
+            else:
+                loose.append(res)
     matched = 0
-    for row in sigs:
-        res = results.get((row["channel"], norm_pair(row["pair"]), row["entry_utc"]))
+    for row in sigs:                                    # (1) pair + entry நேரம்
+        res = exact.get((row["channel"], norm_pair(row["pair"]), row["entry_utc"]))
         if res:
-            row["result_raw"], row["result_class"], row["result_utc"] = \
-                res["result_raw"], res["result_class"], res["result_utc"]
+            _set_result(row, res)
+            matched += 1
+    for res in by_reply:                                # (2) reply இணைப்பு
+        row = by_id.get((res["channel"], res["reply_to"]))
+        if row and not row.get("result_class"):
+            _set_result(row, res)
+            matched += 1
+    loose.sort(key=lambda x: x["result_utc"])
+    for res in loose:                                   # (3) pair அருகாமை
+        best = None
+        for row in sigs:
+            if row["channel"] != res["channel"] or row.get("result_class"):
+                continue
+            if norm_pair(row["pair"]) != res["pair"]:
+                continue
+            gap = (res["result_utc"] - row["entry_utc"]).total_seconds()
+            if -120 <= gap <= LOOSE_MAX_MIN * 60 and (best is None or row["entry_utc"] > best["entry_utc"]):
+                best = row
+        if best:
+            _set_result(best, res)
             matched += 1
     with open(SIGNALS, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS)
+        w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         w.writeheader()
         for row in sigs:
             w.writerow({k: (v.isoformat() if isinstance(v, datetime) else v)
@@ -305,18 +389,21 @@ def load_state(first_key):
 
 
 def migrate(path, fields, default):
-    """பழைய CSV-ல் 'channel' நெடுவரிசை இல்லையென்றால் சேர்"""
+    """பழைய CSV-ல் இல்லாத நெடுவரிசைகளை (channel, reply_to) சேர்"""
     if not os.path.exists(path):
         return
     with open(path, newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
-        if "channel" in (r.fieldnames or []):
+        names = r.fieldnames or []
+        if all(c in names for c in fields):
             return
         rows = list(r)
     for row in rows:
-        row["channel"] = default
+        for c in fields:
+            if row.get(c) is None:
+                row[c] = default if c == "channel" else ""
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
 
@@ -353,7 +440,7 @@ async def main():
                         break
                     await asyncio.sleep(e.seconds + 1)
                 except Exception as e:
-                    print(f"[{idx}] தவிர்க்கப்பட்டது: {e}")
+                    print(f"[{idx}] தவிர்க்கப்பட்டது: {type(e).__name__}")   # public log-ல் சேனல் பெயர் வராமல்
                     break
             if msgs is not None:
                 msgs.reverse()  # பழையது முதலில்
@@ -363,7 +450,9 @@ async def main():
         await client.disconnect()
 
     for idx, (key, (off, msgs)) in enumerate(fetched.items(), 1):
-        raw_rows = [{"channel": key, "msg_id": m.id, "msg_utc": m.date.isoformat(), "text": m.message}
+        raw_rows = [{"channel": key, "msg_id": m.id, "msg_utc": m.date.isoformat(),
+                     "reply_to": (m.reply_to.reply_to_msg_id or "") if getattr(m, "reply_to", None) else "",
+                     "text": m.message}
                     for m in msgs if m.message]
         if raw_rows:
             append_csv(RAW, RAW_FIELDS, raw_rows)
