@@ -1,0 +1,56 @@
+name: log-signals
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # ஒவ்வொரு 30 நிமிடமும் (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tg-session          # ஒரே Telegram session-ஐ இரண்டு run ஒரே நேரத்தில் பயன்படுத்தாமல் தடுக்கும்
+  cancel-in-progress: false
+
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      max-parallel: 1        # ஒவ்வொரு குழுவும் ஒன்றன்பின் ஒன்றாக
+      fail-fast: false
+      matrix:
+        group: [quotex, pocket]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout private data repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/quotex-data
+          token: ${{ secrets.DATA_PAT }}
+          path: data
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run logger (${{ matrix.group }})
+        run: python logger.py
+        env:
+          GROUP: ${{ matrix.group }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          SIGNAL_TZ_OFFSET: "6"      # channels.json-ல் தனி tz இல்லாத சேனல்களுக்கு இயல்பு
+
+      - name: Commit data
+        working-directory: data
+        run: |
+          git config user.name "logger-bot"
+          git config user.email "logger-bot@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || (git commit -m "update ${{ matrix.group }}" && git pull --rebase && git push)
