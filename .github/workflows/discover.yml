@@ -1,0 +1,56 @@
+name: discover-channels
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder:
+        description: "Telegram folder பெயர்"
+        default: "Trading Bots"
+      limit:
+        description: "ஒவ்வொரு சேனலிலும் படிக்கும் மெசேஜ்கள்"
+        default: "200"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tg-session
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout private data repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/quotex-data
+          token: ${{ secrets.DATA_PAT }}
+          path: data
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Discover
+        run: python discover.py
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          FOLDER: ${{ github.event.inputs.folder }}
+          LIMIT: ${{ github.event.inputs.limit }}
+
+      - name: Commit report to private data repo
+        working-directory: data
+        run: |
+          git config user.name "logger-bot"
+          git config user.email "logger-bot@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || (git commit -m "discovery report" && git pull --rebase && git push)
