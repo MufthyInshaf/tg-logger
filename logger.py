@@ -1,4 +1,4 @@
-"""Telegram Quotex signal logger v2 -> data/signals.csv + data/raw_messages.csv
+"""Telegram Quotex signal logger v3 -> data/signals.csv + data/raw_messages.csv
 GitHub Actions-ல் ஓடும். Secrets: API_ID, API_HASH, SESSION_STRING
 """
 import os, re, csv, json, asyncio, unicodedata
@@ -90,13 +90,19 @@ CUR = ("USD|EUR|GBP|JPY|AUD|CAD|CHF|NZD|BRL|INR|PKR|BDT|ARS|COP|EGP|IDR|MXN|NGN|
 PAIR_RE = re.compile(rf"\b(?:{CUR})\s?/?\s?(?:{CUR})(?:[-_ ]?otc[qp]?)?\b", re.I)
 DIR_RE = re.compile(r"\b(PUT|CALL|BUY|SELL|UP|DOWN)\b", re.I)
 TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)")
-RES_RE = re.compile(r"\b(WIN|WON|PROFIT|LOSS|LOST|LOSE|DOJI|REFUND)\b", re.I)
+RES_RE = re.compile(r"\b(WIN|WON|PROFIT|LOSS|LOST|LOSE|HIT|DOJI|REFUND)\b", re.I)
 MTG_RE = re.compile(r"\b(MTG|MG\s?\d|MARTINGALE|GALE|G1|G2|LEVEL\s?\d|STEP\s?\d|PROTECTION)\b", re.I)
 
 
 _RATE_RE = re.compile(r"\b(?:win|loss|lose|success)\s*rate\b[^\n]*", re.I)
 # "Win: 48 | Loss: 14 (77%)", "WINS : 3", "LOSSES : 0" போன்ற புள்ளிவிவர வரிகள் (முடிவு அல்ல)
 _STATS_RE = re.compile(r"\b(?:wins?|loss(?:es)?)\s*[:=]\s*\d+[^\n]*", re.I)
+
+
+def _mtg_win(text):
+    """WIN° / WIN°° / WIN ✅1 / WIN MG1 / Profit ✅1 -> martingale வெற்றி"""
+    return bool(MTG_RE.search(text) or re.search(r"(?:WIN|PROFIT)\s*°", text, re.I)
+                or re.search(r"(?:WIN|PROFIT)\s*✅?\s*[1-3](?![\d:])", text, re.I))
 
 
 def _clean(text):
@@ -131,7 +137,7 @@ def _generic_result(text):
         return None
     words = {w.upper() for w in ms}
     win = bool(words & {"WIN", "WON", "PROFIT"})
-    loss = bool(words & {"LOSS", "LOST", "LOSE"})
+    loss = bool(words & {"LOSS", "LOST", "LOSE", "HIT"})
     p, t = PAIR_RE.search(text), TIME_RE.search(text)
     if not p or (win and loss):
         return None
@@ -140,7 +146,7 @@ def _generic_result(text):
     if words & {"DOJI", "REFUND"} and not (win or loss):
         cls = "D"
     elif win:
-        cls = "MW" if MTG_RE.search(text) else "DW"
+        cls = "MW" if _mtg_win(text) else "DW"
     else:
         cls = "L"
     hhmm = "%s:%s" % (t.group(1), t.group(2)) if t else None
@@ -157,11 +163,11 @@ def _bare_result(text):
         return None
     words = {w.upper() for w in ms}
     win = bool(words & {"WIN", "WON", "PROFIT"})
-    loss = bool(words & {"LOSS", "LOST", "LOSE"})
+    loss = bool(words & {"LOSS", "LOST", "LOSE", "HIT"})
     if win and loss:
         return None
     if win:
-        return sorted(words)[0], ("MW" if (MTG_RE.search(text) or re.search(r"WIN\W*[1-9]", text, re.I)) else "DW")
+        return sorted(words)[0], ("MW" if _mtg_win(text) else "DW")
     if loss:
         return sorted(words)[0], "L"
     return sorted(words)[0], "D"
@@ -184,6 +190,8 @@ def _entry(local_msg, hhmm, future):
 def parse(text, msg_dt, msg_id, tz_offset=None):
     """சிக்னல் (வடிவம் A அல்லது B) என்றால் dict, இல்லையென்றால் None"""
     text = unicodedata.normalize("NFKC", text or "")
+    if re.search(r"PLACAR|SESSION STATS|Summary|Trades\s*:", text, re.I):   # நாள் சுருக்கம்/scoreboard = சிக்னல் அல்ல
+        return None
     fmt = pair = tm = direction = expiry = price = rate = None
     a = find(r"PAIR\W+([A-Za-z0-9/_\-]+)", text)
     b = find(r"TIME\W+(\d{1,2}:\d{2})", text)
