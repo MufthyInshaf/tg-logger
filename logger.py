@@ -1,4 +1,4 @@
-"""Telegram Quotex signal logger v3 -> data/signals.csv + data/raw_messages.csv
+"""Telegram Quotex signal logger v3.1 -> data/signals.csv + data/raw_messages.csv
 GitHub Actions-ல் ஓடும். Secrets: API_ID, API_HASH, SESSION_STRING
 """
 import os, re, csv, json, asyncio, unicodedata
@@ -190,7 +190,7 @@ def _entry(local_msg, hhmm, future):
 def parse(text, msg_dt, msg_id, tz_offset=None):
     """சிக்னல் (வடிவம் A அல்லது B) என்றால் dict, இல்லையென்றால் None"""
     text = unicodedata.normalize("NFKC", text or "")
-    if re.search(r"PLACAR|SESSION STATS|Summary|Trades\s*:", text, re.I):   # நாள் சுருக்கம்/scoreboard = சிக்னல் அல்ல
+    if re.search(r"PLACAR|SESSION STATS|Trades\s*:", text, re.I):   # நாள் சுருக்கம்/scoreboard = சிக்னல் அல்ல
         return None
     fmt = pair = tm = direction = expiry = price = rate = None
     a = find(r"PAIR\W+([A-Za-z0-9/_\-]+)", text)
